@@ -1,12 +1,13 @@
 import argparse
-import json
+import os
 from datetime import datetime, timezone
-from pathlib import Path
 
+import psycopg
 import requests
 
 API_URL = "https://api.coingecko.com/api/v3/simple/price"
 DEFAULT_COINS = ["bitcoin", "ethereum", "solana"]
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 def fetch_prices(coins: list[str]) -> dict:
@@ -16,26 +17,43 @@ def fetch_prices(coins: list[str]) -> dict:
     return response.json()
 
 
-def save_prices(data: dict, out_dir: str) -> Path:
-    directory = Path(out_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = directory / f"prices_{timestamp}.json"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+def store_prices(conn: psycopg.Connection, data: dict, fetched_at: datetime) -> int:
+    coins = [name for name in data if not name.startswith("_")]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prices (
+                id          SERIAL PRIMARY KEY,
+                coin        TEXT        NOT NULL,
+                price_usd   NUMERIC     NOT NULL,
+                fetched_at  TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        for coin in coins:
+            cur.execute(
+                "INSERT INTO prices (coin, price_usd, fetched_at) VALUES (%s, %s, %s)",
+                (coin, data[coin]["usd"], fetched_at),
+            )
+    conn.commit()
+    return len(coins)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch crypto prices from CoinGecko")
+    parser = argparse.ArgumentParser(description="Fetch crypto prices and store them in PostgreSQL")
     parser.add_argument("--coins", nargs="+", default=DEFAULT_COINS, help="coin ids")
-    parser.add_argument("--out", default="data", help="output directory")
     args = parser.parse_args()
 
-    data = fetch_prices(args.coins)
-    data["_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    if not DATABASE_URL:
+        raise SystemExit("DATABASE_URL environment variable is not set")
 
-    path = save_prices(data, args.out)
-    print(f"Saved {path}")
+    data = fetch_prices(args.coins)
+    fetched_at = datetime.now(timezone.utc)
+
+    with psycopg.connect(DATABASE_URL) as conn:
+        count = store_prices(conn, data, fetched_at)
+
+    print(f"Stored {count} prices at {fetched_at.isoformat()}")
 
 
 if __name__ == "__main__":
